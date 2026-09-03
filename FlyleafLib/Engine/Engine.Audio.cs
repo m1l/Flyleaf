@@ -166,7 +166,20 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
                         Devices.Remove(device);
                 }
 
-                var defaultDevice =  deviceEnum.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                IMMDevice defaultDevice = null;
+                try
+                {
+                    defaultDevice = deviceEnum.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia);
+                }
+                catch (SharpGenException e)
+                {
+                    // ERROR_NOT_FOUND (0x80070490): No default render device is currently available
+                    // (e.g. HDMI/monitor audio device disconnected/screen off). Keep CurrentDevice
+                    // as-is; it will recover automatically once Windows assigns a new default device
+                    // and raises OnDefaultDeviceChanged again.
+                    Engine.Log.Info($"No default audio device found ({e.Message})");
+                }
+
                 if (defaultDevice != null)
                 {
                     if (CurrentDevice.Id != defaultDevice.Id)
@@ -175,7 +188,7 @@ public class AudioEngine : CallbackBase, IMMNotificationClient, INotifyPropertyC
                         CurrentDevice.Name  = defaultDevice.FriendlyName;
                         PropertyChanged?.Invoke(this, new(nameof(CurrentDevice)));
                     }
-                    
+
                     defaultDevice.Dispose();
                 }
 
