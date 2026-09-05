@@ -230,137 +230,141 @@ public unsafe partial class AudioDecoder : DecoderBase
                 }
             }
 
-            Monitor.Enter(lockCodecCtx); // restore the old lock / add interrupters similar to the demuxer
             try
             {
-                if (Status == Status.Stopped)
-                    { Monitor.Exit(lockCodecCtx); continue; }
-
-                packet = demuxer.AudioPackets.Dequeue();
-
-                if (packet == null)
-                    { Monitor.Exit(lockCodecCtx); continue; }
-
-                if (isRecording)
+                lock (lockCodecCtx)
                 {
-                    if (!recGotKeyframe && VideoDecoder.StartRecordTime != AV_NOPTS_VALUE && (long)(packet->pts * AudioStream.Timebase) - demuxer.StartTime > VideoDecoder.StartRecordTime)
-                        recGotKeyframe = true;
+                    if (Status == Status.Stopped)
+                        continue;
 
-                    if (recGotKeyframe)
-                        curRecorder.Write(av_packet_clone(packet), !OnVideoDemuxer);
-                }
+                    packet = demuxer.AudioPackets.Dequeue();
 
-                ret = avcodec_send_packet(codecCtx, packet);
-                av_packet_free(&packet);
+                    if (packet == null)
+                        continue;
 
-                if (ret != 0 && ret != AVERROR(EAGAIN))
-                {
-                    if (ret == AVERROR_EOF)
+                    if (isRecording)
                     {
-                        Status = Status.Ended;
-                        break;
+                        if (!recGotKeyframe && VideoDecoder.StartRecordTime != AV_NOPTS_VALUE && (long)(packet->pts * AudioStream.Timebase) - demuxer.StartTime > VideoDecoder.StartRecordTime)
+                            recGotKeyframe = true;
+
+                        if (recGotKeyframe)
+                            curRecorder.Write(av_packet_clone(packet), !OnVideoDemuxer);
                     }
-                    else
+
+                    ret = avcodec_send_packet(codecCtx, packet);
+                    av_packet_free(&packet);
+
+                    if (ret != 0 && ret != AVERROR(EAGAIN))
                     {
-                        allowedErrors--;
-                        if (CanWarn) Log.Warn($"{FFmpegEngine.ErrorCodeToMsg(ret)} ({ret})");
-
-                        if (allowedErrors == 0) { Log.Error("Too many errors!"); Status = Status.Stopping; break; }
-
-                        Monitor.Exit(lockCodecCtx); continue;
-                    }
-                }
-
-                while (true)
-                {
-                    ret = avcodec_receive_frame(codecCtx, frame);
-                    if (ret != 0)
-                    {
-                        av_frame_unref(frame);
-
-                        if (ret == AVERROR_EOF && filterGraph != null)
+                        if (ret == AVERROR_EOF)
                         {
-                            lock (lockSpeed)
+                            Status = Status.Ended;
+                            break;
+                        }
+                        else
+                        {
+                            allowedErrors--;
+                            if (CanWarn)
+                                Log.Warn($"{FFmpegEngine.ErrorCodeToMsg(ret)} ({ret})");
+
+                            if (allowedErrors == 0)
+                            { Log.Error("Too many errors!"); Status = Status.Stopping; break; }
+
+                            continue;
+                        }
+                    }
+
+                    while (true)
+                    {
+                        ret = avcodec_receive_frame(codecCtx, frame);
+                        if (ret != 0)
+                        {
+                            av_frame_unref(frame);
+
+                            if (ret == AVERROR_EOF && filterGraph != null)
                             {
-                                DrainFilters();
-                                Status = Status.Ended;
+                                lock (lockSpeed)
+                                {
+                                    DrainFilters();
+                                    Status = Status.Ended;
+                                }
+                            }
+
+                            break;
+                        }
+
+                        if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
+                            frame->pts = frame->best_effort_timestamp;
+                        else if (frame->pts == AV_NOPTS_VALUE)
+                        {
+                            if (expectingPts == AV_NOPTS_VALUE)
+                            {
+                                av_frame_unref(frame);
+                                continue;
+                            }
+
+                            frame->pts = expectingPts;
+                        }
+
+                        codecChanged = AudioStream.SampleFormat != codecCtx->sample_fmt || AudioStream.SampleRate != codecCtx->sample_rate || AudioStream.ChannelLayout.u.mask != codecCtx->ch_layout.u.mask;
+
+                        if (!filledFromCodec || codecChanged)
+                        {
+                            if (codecChanged && filledFromCodec)
+                            {
+                                Log.Warn($"Codec changed {AudioStream.SampleRate / 1000:g} kHz / {AudioStream.ChannelLayoutStr} / {AudioStream.SampleFormat.ToString().ToLower()} => {codecCtx->sample_rate / 1000:g} kHz / {GetChannelLayoutStr(codecCtx->ch_layout)} / {codecCtx->sample_fmt.ToString().ToLower()}");
+                                DisposeFrames();    // as we reset XAudio we need to avoid feeding those
+                            }
+
+                            DisposeFilters();
+
+                            filledFromCodec = true;
+                            AudioStream.Refresh(this, frame);
+                            codecChanged = false;
+                            resyncWithVideoRequired = !VideoDecoder.Disposed;
+                            streamSampleRateTimebase = new() { Num = 1, Den = codecCtx->sample_rate };
+                            gapOffsetTb = av_rescale_q((long)TimeSpan.FromMilliseconds(40).TotalMicroseconds, TIME_BASE_Q, AudioStream.AVStream->time_base);
+
+                            lock (lockSpeed)
+                                ret = SetupFilters();
+
+                            CodecChanged?.Invoke(this);
+
+                            if (ret != 0)
+                            {
+                                Status = Status.Stopping;
+                                av_frame_unref(frame);
+                                break;
                             }
                         }
 
-                        break;
-                    }
-
-                    if (frame->best_effort_timestamp != AV_NOPTS_VALUE)
-                        frame->pts = frame->best_effort_timestamp;
-                    else if (frame->pts == AV_NOPTS_VALUE)
-                    {
-                        if (expectingPts == AV_NOPTS_VALUE)
+                        if (resyncWithVideoRequired)
                         {
-                            av_frame_unref(frame);
-                            continue;
+                            // TODO: in case of long distance will spin (CPU issue), possible reseek?
+                            while (VideoDecoder.StartTime == AV_NOPTS_VALUE && VideoDecoder.IsRunning && resyncWithVideoRequired)
+                                Thread.Sleep(10);
+
+                            long ts = (long)((frame->pts + frame->duration) * AudioStream.Timebase) - demuxer.StartTime + Config.Audio.Delay;
+
+                            if (ts < VideoDecoder.StartTime)
+                            {
+                                if (CanTrace)
+                                    Log.Trace($"Drops {TicksToTime(ts)} (< V: {TicksToTime(VideoDecoder.StartTime)})");
+                                av_frame_unref(frame);
+                                continue;
+                            }
+                            else
+                                resyncWithVideoRequired = false;
                         }
-
-                        frame->pts = expectingPts;
-                    }
-
-                    codecChanged = AudioStream.SampleFormat != codecCtx->sample_fmt || AudioStream.SampleRate != codecCtx->sample_rate || AudioStream.ChannelLayout.u.mask != codecCtx->ch_layout.u.mask;
-
-                    if (!filledFromCodec || codecChanged)
-                    {
-                        if (codecChanged && filledFromCodec)
-                        {
-                            Log.Warn($"Codec changed {AudioStream.SampleRate / 1000:g} kHz / {AudioStream.ChannelLayoutStr} / {AudioStream.SampleFormat.ToString().ToLower()} => {codecCtx->sample_rate / 1000:g} kHz / {GetChannelLayoutStr(codecCtx->ch_layout)} / {codecCtx->sample_fmt.ToString().ToLower()}");
-                            DisposeFrames();    // as we reset XAudio we need to avoid feeding those
-                        }
-
-                        DisposeFilters();
-
-                        filledFromCodec         = true;
-                        AudioStream.Refresh(this, frame);
-                        codecChanged            = false;
-                        resyncWithVideoRequired = !VideoDecoder.Disposed;
-                        streamSampleRateTimebase= new() { Num = 1, Den = codecCtx->sample_rate};
-                        gapOffsetTb             = av_rescale_q((long)TimeSpan.FromMilliseconds(40).TotalMicroseconds, TIME_BASE_Q, AudioStream.AVStream->time_base);
 
                         lock (lockSpeed)
-                            ret = SetupFilters();
+                            ProcessFilters();
 
-                        CodecChanged?.Invoke(this);
-
-                        if (ret != 0)
-                        {
-                            Status = Status.Stopping;
-                            av_frame_unref(frame);
-                            break;
-                        }
+                        av_frame_unref(frame);
                     }
-
-                    if (resyncWithVideoRequired)
-                    {
-                        // TODO: in case of long distance will spin (CPU issue), possible reseek?
-                        while (VideoDecoder.StartTime == AV_NOPTS_VALUE && VideoDecoder.IsRunning && resyncWithVideoRequired)
-                            Thread.Sleep(10);
-
-                        long ts = (long)((frame->pts + frame->duration) * AudioStream.Timebase) - demuxer.StartTime + Config.Audio.Delay;
-
-                        if (ts < VideoDecoder.StartTime)
-                        {
-                            if (CanTrace) Log.Trace($"Drops {TicksToTime(ts)} (< V: {TicksToTime(VideoDecoder.StartTime)})");
-                            av_frame_unref(frame);
-                            continue;
-                        }
-                        else
-                            resyncWithVideoRequired = false;
-                    }
-
-                    lock (lockSpeed)
-                        ProcessFilters();
-
-                    av_frame_unref(frame);
-                }
-            } catch { }
-
-            Monitor.Exit(lockCodecCtx);
+                }                    
+            }
+            catch { }
 
         } while (Status == Status.Running);
 

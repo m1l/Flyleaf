@@ -5,6 +5,7 @@ namespace FlyleafLib.MediaPlayer;
 partial class Player
 {
     string stoppedWithError = null;
+    int playPending;
 
     /// <summary>
     /// Fires on playback stopped by an error or completed / ended successfully <see cref="Status"/>
@@ -37,11 +38,17 @@ partial class Player
             if (!canPlay || status == Status.Playing || status == Status.Ended)
                 return;
 
+            if (taskPlayRuns || taskSeekRuns)
+            {
+                Volatile.Write(ref playPending, 1);
+                return;
+            }
+
+            decoder.Interrupt = false;
             status = Status.Playing;
             UI(() => Status = status);
         }
 
-        while (taskPlayRuns || taskSeekRuns) Thread.Sleep(5);
         taskPlayRuns = true;
 
         Thread t = new(PlayThread)
@@ -106,8 +113,11 @@ partial class Player
                 decoder?.Initialize();
             else if (decoder != null)
             {
-                decoder.PauseOnQueueFull();
-                decoder.PauseDecoders();
+                lock (stepSeekLock)
+                {
+                    decoder.PauseOnQueueFull();
+                    decoder.PauseDecoders();
+                }
             }
 
             Audio.ClearBuffer();
@@ -153,6 +163,10 @@ partial class Player
             });
 
             taskPlayRuns = false;
+            bool restart = Interlocked.Exchange(ref playPending, 0) == 1;
+
+            if (restart)
+                Play();
         }
     }
 
@@ -166,10 +180,10 @@ partial class Player
             if (!canPlay || status == Status.Ended)
                 return;
 
+            Volatile.Write(ref playPending, 0);
+            decoder.Interrupt = true;
             status = Status.Paused;
             UI(() => Status = status);
-
-            while (taskPlayRuns) Thread.Sleep(5);
         }
     }
 

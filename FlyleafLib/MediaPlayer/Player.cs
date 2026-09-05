@@ -584,7 +584,9 @@ public unsafe partial class Player : NotifyPropertyChanged, IDisposable
                 canPlay = false;
                 isVideoSwitch = false;
                 seeks.Clear();
+                Volatile.Write(ref playPending, 0);
 
+                decoder.Interrupt = true;
                 while (taskPlayRuns || taskSeekRuns) Thread.Sleep(5);
 
                 if (andDecoder)
